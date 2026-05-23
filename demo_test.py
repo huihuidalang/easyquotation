@@ -55,94 +55,108 @@ def _get_board_name(code):
     return "其他"
 
 
+
 def _fetch_history_by_date(date_str):
-    """通过东方财富历史K线接口获取指定日期的全市场行情数据
+    """通过腾讯接口获取指定日期的全市场行情数据
     date_str: 日期字符串，如 "20250110" 或 "2025-01-10"
     返回: dict {code: {name, open, close, now, high, low, turnover, volume, date}}
 
-    实现思路：
-    1. 先用新浪实时接口获取全市场股票代码和名称列表
-    2. 用东方财富历史K线接口批量查询，beg设为目标日前7天，确保能获取到前一日昨收
-    3. 使用多线程并发加速
+    优化思路：
+    1. 使用新浪接口获取股票代码和名称列表（1次批量请求）
+    2. 如果目标日期是今天，直接使用新浪实时行情数据，无需逐只查询
+    3. 历史日期使用腾讯历史K线接口，多线程并发加速
     """
     import json
+    import re
     import requests
     import datetime as _dt
     from concurrent.futures import ThreadPoolExecutor, as_completed
-    from kline import _get_market_prefix
 
-    # 统一日期格式
     d = date_str.replace("-", "")
     formatted_date = f"{d[:4]}-{d[4:6]}-{d[6:8]}"
 
-    # 计算beg日期：往前推7个自然日，确保能拿到前一日数据
     try:
         target_dt = _dt.datetime.strptime(d, "%Y%m%d")
     except ValueError:
         print(f"日期格式错误: {date_str}")
         return {}
-    beg_dt = target_dt - _dt.timedelta(days=7)
-    beg_str = beg_dt.strftime("%Y%m%d")
 
-    # 第一步：获取股票代码列表
+    # 判断目标日期是否为今天
+    today_str = _dt.datetime.now().strftime("%Y%m%d")
+    if d == today_str:
+        print(f"目标日期为今天，直接使用新浪实时行情数据...")
+        quotation = easyquotation.use("sina")
+        return quotation.market_snapshot(prefix=True)
+
+    # 历史日期：获取股票列表 + 逐只腾讯K线查询
     print("正在获取股票代码列表...")
     quotation = easyquotation.use("sina")
     snapshot = quotation.market_snapshot(prefix=True)
     codes = list(snapshot.keys())
     print(f"共 {len(codes)} 只股票，开始获取 {formatted_date} 历史行情...")
 
-    # 第二步：定义单只股票查询函数
     def fetch_one(code):
         info = snapshot.get(code, {})
         name = info.get("name", "")
-        prefix, num = _get_market_prefix(code)
-        # secid: 1.代码=沪, 0.代码=深/北
-        if prefix == "sh":
-            secid = f"1.{num}"
-        else:
-            secid = f"0.{num}"
 
-        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+        # 腾讯K线接口symbol格式: sh600000, sz000001
+        # 北交所股票腾讯不支持，跳过
+        if code.startswith("bj"):
+            return None
+
+        symbol = code
+
+        # 使用不复权数据计算涨跌幅（前复权会调整历史价格，导致涨跌幅计算错误）
+        url = "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
         params = {
-            "secid": secid,
-            "fields1": "f1,f2,f3,f4,f5,f6",
-            "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-            "klt": "101",   # 日K
-            "fqt": "1",     # 前复权
-            "beg": beg_str,
-            "end": d,
-            "lmt": "10",    # 取最近10天，从中找目标日和前一日
+            "_var": "kline_day",
+            "param": f"{symbol},day,,,15,",
         }
         try:
-            headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://quote.eastmoney.com/",
-            }
-            r = requests.get(url, params=params, headers=headers, timeout=5)
-            data = r.json()
+            r = requests.get(url, params=params, timeout=5)
+            text = r.text
+            # 解析JS变量赋值: kline_day={...}
+            match = re.search(r'kline_day=(\{.*\})', text, re.DOTALL)
+            if not match:
+                return None
+            data = json.loads(match.group(1))
         except Exception:
             return None
 
-        if data.get("rc") != 0:
+        if data.get("code") != 0:
             return None
 
-        klines = data.get("data", {}).get("klines", [])
+        # 提取K线数据（不复权）
+        stock_data = data.get("data", {}).get(symbol, {})
+        klines = stock_data.get("day", [])
         if not klines:
             return None
 
-        # klines格式: "日期,开盘,收盘,最高,最低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率"
+        # 找目标日期的行和前一日收盘价
+        # 腾讯返回格式: [日期, 开盘, 收盘, 最高, 最低, 成交量]
         target_row = None
-        prev_close = 0
-        for row_str in klines:
-            parts = row_str.split(",")
-            row_date = parts[0].replace("-", "")
+        prev_row = None
+        for i, item in enumerate(klines):
+            row_date = str(item[0]).replace("-", "")
             if row_date == d:
-                target_row = parts
-            elif row_date < d:
-                # 取最接近目标日期的前一天作为昨收
-                prev_close = float(parts[2]) if len(parts) > 2 else 0
+                target_row = item
+                # 取紧邻的前一条K线作为昨收
+                if i > 0:
+                    prev_row = klines[i - 1]
+                break
+            # 保留最后一条早于目标日期的记录
+            if row_date < d:
+                prev_row = item
 
-        if not target_row:
+        # 计算昨收价（不复权）
+        prev_close = 0
+        if prev_row is not None:
+            try:
+                prev_close = float(prev_row[2])
+            except (ValueError, TypeError, IndexError):
+                prev_close = 0
+
+        if target_row is None:
             return None
 
         try:
@@ -150,25 +164,23 @@ def _fetch_history_by_date(date_str):
             close_price = float(target_row[2])
             high_price = float(target_row[3])
             low_price = float(target_row[4])
-            volume_amt = float(target_row[6]) if len(target_row) > 6 else 0  # 成交额
-            turnover_rate = float(target_row[10]) if len(target_row) > 10 else 0  # 换手率
-        except (ValueError, IndexError):
+            volume_amt = float(target_row[5]) if len(target_row) > 5 else 0
+        except (ValueError, TypeError, IndexError):
             return None
 
         return (code, {
             "name": name,
             "open": open_price,
-            "close": prev_close,      # 昨收
-            "now": close_price,       # 现价=当日收盘价
+            "close": prev_close,
+            "now": close_price,
             "high": high_price,
             "low": low_price,
-            "turnover": turnover_rate,
+            "turnover": 0,  # 腾讯K线不提供换手率
             "volume": volume_amt,
             "date": formatted_date,
             "time": "",
         })
 
-    # 第三步：多线程并发查询
     result = {}
     total = len(codes)
     done_count = 0
@@ -191,6 +203,18 @@ def _fetch_history_by_date(date_str):
 
     print(f"获取到 {len(result)} 只股票（{formatted_date}），失败 {fail_count} 只")
     return result
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def get_all_stocks_data(board="全部", change_pct_min=None, change_pct_max=None, limit=None, date_str=None):
@@ -239,18 +263,25 @@ def get_all_stocks_data(board="全部", change_pct_min=None, change_pct_max=None
         if now <= 0:
             continue
         close = info.get("close", 0)
-        change_pct = ((now / close) - 1) * 100 if close else 0
+        if close <= 0:
+            # 昨收为0则无法计算涨跌幅，跳过
+            continue
+        change_pct = ((now / close) - 1) * 100
 
-        # 涨停/跌停过滤：根据各板块涨跌停幅度判断
+        # 涨停/跌停过滤：使用涨停价/跌停价精确判断
         board_name = _get_board_name(code)
         limit_pct = LIMIT_MAP.get(board_name, 10.0)
+        # 涨停价 = 昨收 × (1 + 涨停幅度/100)，四舍五入到2位小数
+        limit_up_price = round(close * (1 + limit_pct / 100), 2)
+        # 跌停价 = 昨收 × (1 - 涨停幅度/100)，四舍五入到2位小数
+        limit_down_price = round(close * (1 - limit_pct / 100), 2)
         if is_limit_up:
-            # 涨停：涨跌幅 >= 涨停幅度（允许0.5%误差，因为数据精度）
-            if change_pct < limit_pct - 0.5:
+            # 涨停：现价 >= 涨停价（允许0.01误差，因四舍五入）
+            if now < limit_up_price - 0.01:
                 continue
         elif is_limit_down:
-            # 跌停：涨跌幅 <= -跌停幅度（允许0.5%误差）
-            if change_pct > -limit_pct + 0.5:
+            # 跌停：现价 <= 跌停价（允许0.01误差）
+            if now > limit_down_price + 0.01:
                 continue
         else:
             # 普通涨跌幅过滤
