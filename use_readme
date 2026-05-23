@@ -1,0 +1,4 @@
+python demo_test.py --kline --indicators macd,kdj,rsi,boll,dmi,expma --board 创业板 --limit 涨停  --kline_days 180
+
+
+python demo_test.py --kline --indicators macd,kdj,rsi,boll,dmi,expma --board 创业板 --limit 涨停  --kline_days 180 --date 20230101
